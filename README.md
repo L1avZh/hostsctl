@@ -12,5 +12,16 @@ A tiny, safe helper for `/etc/hosts` that can add/remove hostnames idempotently.
 ## Quick Start
 ```bash
 chmod +x hostsctl
-sudo ./hostsctl add [ip] [domain]
-./hostsctl exists [domain]
+sudo ./hostsctl add [ip] [hostname]
+./hostsctl exists [hostname]
+```
+
+## Usage
+```bash
+hostsctl add <ip> <hostname> [more_hostnames...]
+hostsctl remove <hostname>
+hostsctl exists <hostname>
+hostsctl list
+hostsctl backup [path]
+hostsctl restore <path>
+```
