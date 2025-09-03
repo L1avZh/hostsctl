@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hostsctl: safe helper for /etc/hosts
+# Usage:
+#   hostsctl add <ip> <hostname> [more_hostnames...]
+#   hostsctl remove <hostname>
+#   hostsctl exists <hostname>
+#   hostsctl list
+#   hostsctl backup [path]
+#   hostsctl restore <path>
+#
+# Env:
+#   HOSTS_PATH  (default: /etc/hosts)
+
+HOSTS_PATH="${HOSTS_PATH:-/etc/hosts}"
+
+die() { echo "Error: $*" >&2; exit 1; }
+need_sudo() { [ -w "$HOSTS_PATH" ] || [ "$(id -u)" -eq 0 ]; }
+require_sudo() {
+  if [ -w "$HOSTS_PATH" ]; then return; fi
+  if [ "$(id -u)" -ne 0 ]; then
+    die "Writing to $HOSTS_PATH requires root. Re-run with sudo."
+  fi
+}
+
+ip_ok() {
+  # IPv4 simple validation
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r a b c d <<<"$ip"
+  for o in "$a" "$b" "$c" "$d"; do
+    (( o >= 0 && o <= 255 )) || return 1
+  done
+  return 0
+}
+
+backup() {
+  local dest="${1:-"$HOSTS_PATH.$(date +%Y%m%d-%H%M%S).bak"}"
+  cp -p -- "$HOSTS_PATH" "$dest"
+  echo "$dest"
+}
+
+atomic_write() {
+  local tmp
+  tmp="$(mktemp "${HOSTS_PATH}.XXXXXX")"
+  cat > "$tmp"
+  # Preserve permissions/ownership
+  chown --reference="$HOSTS_PATH" "$tmp" 2>/dev/null || true
+  chmod --reference="$HOSTS_PATH" "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$HOSTS_PATH"
+}
+
+flush_dns_cache() {
+  # Best-effort DNS cache flush
+  if command -v dscacheutil >/dev/null 2>&1; then
+    dscacheutil -flushcache || true
+  fi
+  if command -v killall >/dev/null 2>&1; then
+    killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+  if command -v nscd >/dev/null 2>&1; then
+    sudo nscd -i hosts 2>/dev/null || true
+  fi
+  if command -v systemd-resolve >/dev/null 2>&1; then
+    systemd-resolve --flush-caches 2>/dev/null || true
+  fi
+}
+
+cmd_add() {
+  local ip="$1"; shift || true
+  [ $# -ge 1 ] || die "Usage: hostsctl add <ip> <hostname> [more...]"
+  ip_ok "$ip" || die "Invalid IPv4: $ip"
+
+  # Normalize hostnames: lowercase, strip spaces
+  mapfile -t hosts < <(for h in "$@"; do
+    echo "$h" | tr '[:upper:]' '[:lower:]' | tr -s ' '
+  done)
+
+  require_sudo
+  backup_path=$(backup)
+  echo "Backup created: $backup_path"
+
+  # Build new hosts file
+  # 1) Strip any of the hostnames if they already exist on any line
+  # 2) Append a new line with ip + unique hostnames
+  awk -v HLIST="${hosts[*]}" '
+    BEGIN {
+      split(HLIST, arr, " ");
+      for (i in arr) { tgt[arr[i]]=1 }
+    }
+    {
+      keep=1
+      for (i=1;i<=NF;i++){
+        if ($i in tgt){ keep=0; break }
+      }
+      if (keep) { print $0 }
+    }
+  ' "$HOSTS_PATH" | {
+    # append new combined line
+    printf "%s" "$(cat)"
+    echo
+    echo -n "$ip"
+    for h in "${hosts[@]}"; do
+      echo -n " $h"
+    done
+    echo
+  } | atomic_write
+
+  flush_dns_cache
+  echo "Added: $ip ${hosts[*]} -> $HOSTS_PATH"
+}
+
+cmd_remove() {
+  local hostname="${1:-}"; [ -n "$hostname" ] || die "Usage: hostsctl remove <hostname>"
+  hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
+
+  require_sudo
+  backup_path=$(backup)
+  echo "Backup created: $backup_path"
+
+  # Remove hostname from any line; drop line if it becomes only an IP with no names
+  awk -v H="$hostname" '
+    {
+      out=""
+      for (i=1;i<=NF;i++){
+        if ($i==H) continue
+        if (out=="") out=$i; else out=out" "$i
+      }
+      # If line had only the hostname with no IP left, skip
+      n=split(out, f, " ")
+      if (n==1 && f[1] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { next }
+      print out
+    }
+  ' "$HOSTS_PATH" | atomic_write
+
+  flush_dns_cache
+  echo "Removed: $hostname"
+}
+
+cmd_exists() {
+  local hostname="${1:-}"; [ -n "$hostname" ] || die "Usage: hostsctl exists <hostname>"
+  hostname="$(echo "$hostname" | tr '[:upper:]' '[:lower:]')"
+  if awk -v H="$hostname" '
+      {
+        for (i=1;i<=NF;i++){
+          if ($i==H){ print "yes"; exit 0 }
+        }
+      }
+    ' "$HOSTS_PATH" | grep -q yes; then
+    echo "exists"
+    exit 0
+  else
+    echo "absent"
+    exit 1
+  fi
+}
+
+cmd_list() {
+  # Show only non-comment, non-empty lines
+  awk 'NF>0 && $1 !~ /^#/' "$HOSTS_PATH"
+}
+
+cmd_backup() {
+  local path="${1:-}"
+  local out
+  out="$(backup "$path")"
+  echo "Backup: $out"
+}
+
+cmd_restore() {
+  local src="${1:-}"; [ -n "$src" ] || die "Usage: hostsctl restore <backup_path>"
+  [ -f "$src" ] || die "Backup not found: $src"
+  require_sudo
+  cp -p -- "$src" "$HOSTS_PATH"
+  flush_dns_cache
+  echo "Restored $HOSTS_PATH from $src"
+}
+
+usage() {
+  cat <<'EOF'
+hostsctl — safe helper for /etc/hosts
+
+Usage:
+  hostsctl add <ip> <hostname> [more_hostnames...]
+  hostsctl remove <hostname>
+  hostsctl exists <hostname>
+  hostsctl list
+  hostsctl backup [path]
+  hostsctl restore <path>
+
+Env:
+  HOSTS_PATH   Path to hosts file (default: /etc/hosts)
+
+Examples:
+  sudo hostsctl add 10.129.232.3 environment.htb
+  sudo hostsctl add 10.129.232.3 environment.htb www.environment.htb
+  hostsctl exists environment.htb
+  sudo hostsctl remove environment.htb
+  hostsctl list
+  hostsctl backup
+  sudo hostsctl restore /etc/hosts.20250903-101530.bak
+EOF
+}
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  case "$1" in
+    add) shift; [ $# -ge 2 ] || die "Usage: hostsctl add <ip> <hostname> [more...]"; cmd_add "$@";;
+    remove) shift; cmd_remove "${1:-}";;
+    exists) shift; cmd_exists "${1:-}";;
+    list) shift || true; cmd_list;;
+    backup) shift || true; cmd_backup "${1:-}";;
+    restore) shift; cmd_restore "${1:-}";;
+    -h|--help|help) usage;;
+    *) die "Unknown command: $1 (use --help)";;
+  esac
+}
+
+main "$@"
