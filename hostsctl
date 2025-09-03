@@ -191,15 +191,6 @@ Usage:
 
 Env:
   HOSTS_PATH   Path to hosts file (default: /etc/hosts)
-
-Examples:
-  sudo hostsctl add [ip] [hostname]
-  sudo hostsctl add [ip] [hostname] [hostname]
-  hostsctl exists [hostname]
-  sudo hostsctl remove [hostname]
-  hostsctl list
-  hostsctl backup
-  sudo hostsctl restore /etc/hosts.20250903-101530.bak
 EOF
 }
 
